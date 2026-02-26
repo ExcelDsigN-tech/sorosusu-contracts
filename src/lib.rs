@@ -91,6 +91,9 @@ pub struct CircleInfo {
     pub current_pot_recipient: Address, // New: Track who can claim the pot
     pub member_addresses: Vec<Address>, // New: Track member addresses for efficient lookup
     pub yield_deposited: u64,
+    pub recovery_old_address: Option<Address>,
+    pub recovery_new_address: Option<Address>,
+    pub recovery_votes_bitmap: u64,
 }
 
 #[contracttype]
@@ -138,6 +141,10 @@ pub trait SoroSusuTrait {
 
     // Vote on the current proposal
     fn vote_penalty_change(env: Env, user: Address, circle_id: u64);
+
+    // Propose and vote for social recovery address change
+    fn propose_address_change(env: Env, user: Address, circle_id: u64, old_address: Address, new_address: Address);
+    fn vote_for_recovery(env: Env, user: Address, circle_id: u64);
 
     // Eject a member (burns NFT)
     fn eject_member(env: Env, caller: Address, circle_id: u64, member: Address);
@@ -229,6 +236,76 @@ fn apply_referral_discount(env: &Env, circle: &CircleInfo, member: &Member, pena
     } else {
         penalty_amount
     }
+}
+
+fn count_active_members(env: &Env, circle: &CircleInfo) -> u32 {
+    let mut active_count = 0u32;
+    for i in 0..circle.member_count {
+        let member_address = circle.member_addresses.get(i).unwrap();
+        let member_key = DataKey::Member(member_address);
+        if let Some(member) = env.storage().instance().get::<DataKey, Member>(&member_key) {
+            if member.status == MemberStatus::Active {
+                active_count += 1;
+            }
+        }
+    }
+    active_count
+}
+
+fn apply_recovery_if_consensus(env: &Env, circle: &mut CircleInfo) {
+    let active_members = count_active_members(env, circle);
+    if active_members == 0 {
+        panic!("No active members");
+    }
+
+    let votes = circle.recovery_votes_bitmap.count_ones();
+    if votes * 100 <= active_members * 70 {
+        return;
+    }
+
+    let old_address = circle
+        .recovery_old_address
+        .clone()
+        .unwrap_or_else(|| panic!("No recovery proposal"));
+    let new_address = circle
+        .recovery_new_address
+        .clone()
+        .unwrap_or_else(|| panic!("No recovery proposal"));
+
+    let old_member_key = DataKey::Member(old_address.clone());
+    let mut old_member: Member = env
+        .storage()
+        .instance()
+        .get(&old_member_key)
+        .unwrap_or_else(|| panic!("Old member not found"));
+
+    if old_member.status != MemberStatus::Active {
+        panic!("Only active members can be recovered");
+    }
+
+    let new_member_key = DataKey::Member(new_address.clone());
+    if env.storage().instance().has(&new_member_key) {
+        panic!("New address is already a member");
+    }
+
+    old_member.address = new_address.clone();
+    env.storage().instance().set(&new_member_key, &old_member);
+    env.storage().instance().remove(&old_member_key);
+
+    let mut updated_addresses = Vec::new(env);
+    for i in 0..circle.member_count {
+        let member_address = circle.member_addresses.get(i).unwrap();
+        if i == old_member.index {
+            updated_addresses.push_back(new_address.clone());
+        } else {
+            updated_addresses.push_back(member_address);
+        }
+    }
+    circle.member_addresses = updated_addresses;
+
+    circle.recovery_old_address = None;
+    circle.recovery_new_address = None;
+    circle.recovery_votes_bitmap = 0;
 }
 
 // Execute finalize round operation
@@ -412,6 +489,9 @@ impl SoroSusuTrait for SoroSusu {
             current_pot_recipient: creator.clone(), // Initialize with creator
             member_addresses: Vec::new(&env), // Initialize empty member addresses vector
             yield_deposited: 0,
+            recovery_old_address: None,
+            recovery_new_address: None,
+            recovery_votes_bitmap: 0,
         };
 
         // 4. Save the Circle and the new Count
@@ -768,6 +848,61 @@ impl SoroSusuTrait for SoroSusu {
             circle.proposed_late_fee_bps = 0;
             circle.proposal_votes_bitmap = 0;
         }
+
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+    }
+
+    fn propose_address_change(env: Env, user: Address, circle_id: u64, old_address: Address, new_address: Address) {
+        user.require_auth();
+
+        if old_address == new_address {
+            panic!("Old and new addresses must differ");
+        }
+
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+
+        let proposer_key = DataKey::Member(user.clone());
+        let proposer: Member = env.storage().instance().get(&proposer_key).expect("User is not a member");
+        if proposer.status != MemberStatus::Active {
+            panic!("Member is not active");
+        }
+
+        let old_member_key = DataKey::Member(old_address.clone());
+        let old_member: Member = env.storage().instance().get(&old_member_key).expect("Old address is not a member");
+        if old_member.status != MemberStatus::Active {
+            panic!("Old address member is not active");
+        }
+
+        let new_member_key = DataKey::Member(new_address.clone());
+        if env.storage().instance().has(&new_member_key) {
+            panic!("New address is already a member");
+        }
+
+        circle.recovery_old_address = Some(old_address);
+        circle.recovery_new_address = Some(new_address);
+        circle.recovery_votes_bitmap = 0;
+        circle.recovery_votes_bitmap |= 1 << proposer.index;
+
+        apply_recovery_if_consensus(&env, &mut circle);
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+    }
+
+    fn vote_for_recovery(env: Env, user: Address, circle_id: u64) {
+        user.require_auth();
+
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        if circle.recovery_old_address.is_none() || circle.recovery_new_address.is_none() {
+            panic!("No active recovery proposal");
+        }
+
+        let member_key = DataKey::Member(user.clone());
+        let member: Member = env.storage().instance().get(&member_key).expect("User is not a member");
+        if member.status != MemberStatus::Active {
+            panic!("Member is not active");
+        }
+
+        circle.recovery_votes_bitmap |= 1 << member.index;
+        apply_recovery_if_consensus(&env, &mut circle);
 
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
     }
